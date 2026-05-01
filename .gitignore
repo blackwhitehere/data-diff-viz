@@ -1,0 +1,4 @@
+/target
+/app.log
+/demo-data
+Cargo.lock

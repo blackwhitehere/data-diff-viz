@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>data-diff-viz</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+    html, body { margin: 0; padding: 0; height: 100%; background: #111; color: #f1f1f1; }
+    #app { display: grid; grid-template-rows: auto auto 1fr; height: 100vh; }
+    header { grid-row: 1; padding: 0.5rem 1rem; background: #181818; border-bottom: 1px solid #333; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    header h1 { font-size: 1rem; margin: 0; font-weight: 600; }
+    .legend { display: flex; gap: 0.75rem; align-items: center; font-size: 0.85rem; }
+    .summary { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; font-size: 0.78rem; }
+    .summary-chip { display: inline-flex; align-items: center; gap: 0.35rem; padding: 0.2rem 0.45rem; border: 1px solid #2d2d2d; border-radius: 999px; background: #202020; color: #ddd; }
+    .summary-chip strong { color: #f5f5f5; font-weight: 600; }
+    .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 2px; vertical-align: middle; margin-right: 0.25rem; }
+    label.dataset-pick { font-size: 0.85rem; display: inline-flex; align-items: center; gap: 0.4rem; }
+    label.dataset-pick select { background: #2a2a2a; color: #f1f1f1; border: 1px solid #444; padding: 0.25rem 0.4rem; border-radius: 3px; font: inherit; }
+    .controls { font-size: 0.8rem; color: #aaa; margin-left: auto; display: flex; align-items: center; gap: 0.5rem; }
+    .controls button { background: #2a2a2a; color: #f1f1f1; border: 1px solid #444; padding: 0.25rem 0.5rem; cursor: pointer; border-radius: 3px; }
+    .controls button:hover { background: #333; }
+    #banner { grid-row: 2; padding: 0.5rem 1rem; background: #3a2c00; color: #ffd285; border-bottom: 1px solid #5a4400; font-size: 0.85rem; display: none; }
+    #banner.visible { display: block; }
+    #canvas-wrap { grid-row: 3; position: relative; overflow: hidden; }
+    #grid-canvas { display: block; image-rendering: pixelated; cursor: grab; }
+    #grid-canvas.inspectable { cursor: pointer; }
+    #grid-canvas.dragging { cursor: grabbing; }
+    #status-bar { position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.6); padding: 0.25rem 0.5rem; border-radius: 3px; font-size: 0.75rem; color: #ddd; pointer-events: none; }
+    #modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: center; justify-content: center; z-index: 10; }
+    #modal-backdrop.visible { display: flex; }
+    #modal { background: #1c1c1c; border: 1px solid #333; padding: 1rem 1.25rem; border-radius: 6px; min-width: 320px; max-width: 80vw; max-height: 80vh; overflow: auto; }
+    #modal h2 { margin: 0 0 0.5rem 0; font-size: 1rem; }
+    #modal table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+    #modal td, #modal th { padding: 0.25rem 0.5rem; border-bottom: 1px solid #2a2a2a; text-align: left; }
+    #modal .close { float: right; cursor: pointer; color: #888; }
+    #modal .pill { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 10px; font-size: 0.7rem; font-weight: 600; color: #111; }
+    .pill.equal { background: #22c55e; }
+    .pill.close { background: #f97316; }
+    .pill.diff { background: #ef4444; color: white; }
+    .pill.missing { background: #6b7280; color: white; }
+    code { font-family: 'SF Mono', Menlo, monospace; word-break: break-all; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>data-diff-viz</h1>
+    <label class="dataset-pick" id="dataset-pick" style="display:none">
+      dataset
+      <select id="dataset-select"></select>
+    </label>
+    <div class="legend">
+      <span><span class="swatch" style="background:#22c55e"></span>equal</span>
+      <span><span class="swatch" style="background:#f97316"></span>close</span>
+      <span><span class="swatch" style="background:#ef4444"></span>diff</span>
+      <span><span class="swatch" style="background:#6b7280"></span>missing</span>
+    </div>
+    <div class="summary" id="summary"></div>
+    <div class="controls">
+      <button id="btn-zoom-in" title="zoom in">+</button>
+      <button id="btn-zoom-out" title="zoom out">−</button>
+      <button id="btn-reset" title="fit to screen">reset</button>
+      <span id="zoom-label"></span>
+    </div>
+  </header>
+  <div id="banner"></div>
+  <div id="canvas-wrap">
+    <canvas id="grid-canvas"></canvas>
+    <div id="status-bar"></div>
+  </div>
+</div>
+<div id="modal-backdrop">
+  <div id="modal">
+    <span class="close" onclick="closeModal()">&times;</span>
+    <h2 id="modal-title">cell</h2>
+    <div id="modal-body"></div>
+  </div>
+</div>
+<script>
+const COLORS = {
+  0: [0x22, 0xc5, 0x5e], // equal — green
+  1: [0xf9, 0x73, 0x16], // close — orange
+  2: [0xef, 0x44, 0x44], // diff — red
+  3: [0x6b, 0x72, 0x80], // missing — grey
+};
+const COLOR_CSS = {
+  0: "rgb(34,197,94)",
+  1: "rgb(249,115,22)",
+  2: "rgb(239,68,68)",
+  3: "rgb(107,114,128)",
+};
+const BG = "#0a0a0a";
+const GRIDLINE = "rgba(0,0,0,0.5)";
+// switch from bitmap blit to per-cell fillRect at this px/cell scale
+const VECTOR_SCALE_THRESHOLD = 3;
+// draw thin gridlines between cells once they're at least this wide
+const GRIDLINE_THRESHOLD = 10;
+
+const state = {
+  meta: null,
+  datasetId: null,
+  datasets: [],
+  cellPxX: 1,          // device pixels per level-0 column
+  cellPxY: 1,          // device pixels per level-0 row
+  panX: 0,             // device-px offset of grid origin from canvas (0,0)
+  panY: 0,
+  tileBytes: new Map(),// key "ds:L:tx:ty" -> Uint8Array
+  tileImg: new Map(),  // key "ds:L:tx:ty" -> ImageData (built lazily)
+  pending: new Set(),
+  dragging: false,
+  dragStartX: 0,
+  dragStartY: 0,
+  dragMoved: 0,
+  raf: 0,
+  dpr: window.devicePixelRatio || 1,
+};
+
+const canvas = document.getElementById("grid-canvas");
+const wrap = document.getElementById("canvas-wrap");
+const ctx = canvas.getContext("2d", { alpha: false });
+const statusBar = document.getElementById("status-bar");
+const datasetSelect = document.getElementById("dataset-select");
+
+function setCanvasSize() {
+  const rect = wrap.getBoundingClientRect();
+  canvas.style.width = rect.width + "px";
+  canvas.style.height = rect.height + "px";
+  canvas.width = Math.max(1, Math.floor(rect.width * state.dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * state.dpr));
+}
+
+function formatPct(count, total) {
+  if (!total) return "0%";
+  const pct = (count / total) * 100;
+  return pct >= 99.95 || pct <= 0.05 ? `${pct.toFixed(0)}%` : `${pct.toFixed(1)}%`;
+}
+
+function renderSummary(meta) {
+  const total = meta.status_counts.equal + meta.status_counts.close + meta.status_counts.diff + meta.status_counts.missing;
+  const items = [
+    ["equal", "#22c55e", meta.status_counts.equal],
+    ["close", "#f97316", meta.status_counts.close],
+    ["diff", "#ef4444", meta.status_counts.diff],
+    ["missing", "#6b7280", meta.status_counts.missing],
+  ];
+  document.getElementById("summary").innerHTML = items.map(([label, color, count]) => (
+    `<span class="summary-chip"><span class="swatch" style="background:${color}"></span>${label} <strong>${count.toLocaleString()}</strong> ${formatPct(count, total)}</span>`
+  )).join("");
+}
+
+window.addEventListener("resize", () => { setCanvasSize(); scheduleRender(); });
+
+async function loadDatasets() {
+  const r = await fetch("/api/datasets");
+  if (!r.ok) throw new Error("failed to load /api/datasets");
+  const data = await r.json();
+  state.datasets = data.datasets;
+  datasetSelect.innerHTML = "";
+  for (const d of data.datasets) {
+    const opt = document.createElement("option");
+    opt.value = d.id;
+    opt.textContent = `${d.label} (${d.rows.toLocaleString()} × ${d.cols})`;
+    datasetSelect.appendChild(opt);
+  }
+  datasetSelect.value = data.default_id;
+  if (data.datasets.length > 1) {
+    document.getElementById("dataset-pick").style.display = "inline-flex";
+  }
+  state.datasetId = data.default_id;
+  await loadMeta();
+}
+
+datasetSelect.addEventListener("change", async (e) => {
+  state.datasetId = e.target.value;
+  // Clear caches for the previous dataset's tiles. We keyed by ds:L:tx:ty,
+  // so the new dataset's fetches will start fresh; the old entries stay
+  // resident until GC, which is fine for a few datasets.
+  state.tileImg.clear();
+  await loadMeta();
+});
+
+async function loadMeta() {
+  const r = await fetch(`/api/meta?dataset=${encodeURIComponent(state.datasetId)}`);
+  if (!r.ok) throw new Error("meta load failed");
+  state.meta = await r.json();
+  renderSummary(state.meta);
+  // alignment banner
+  const banner = document.getElementById("banner");
+  const a = state.meta.alignment;
+  const msgs = [];
+  if (a.columns_reordered) msgs.push("columns were reordered to align");
+  if (a.rows_sorted_by && a.rows_sorted_by.length) {
+    msgs.push("rows were sorted by " + a.rows_sorted_by.join(", ") + " to align");
+  }
+  if (a.columns_only_in_left.length) msgs.push("only in left: " + a.columns_only_in_left.join(", "));
+  if (a.columns_only_in_right.length) msgs.push("only in right: " + a.columns_only_in_right.join(", "));
+  if (a.row_count_diff !== 0) msgs.push("row counts differ by " + a.row_count_diff);
+  if (msgs.length) {
+    banner.textContent = "warning: " + msgs.join("; ");
+    banner.classList.add("visible");
+  } else {
+    banner.textContent = "";
+    banner.classList.remove("visible");
+  }
+  setCanvasSize();
+  fitToScreen();
+}
+
+/// Pick cellPx and pan so the entire grid fits inside the canvas and is
+/// centered both horizontally and vertically.
+function fitToScreen() {
+  if (!state.meta) return;
+  const padding = 0.97; // leave a little margin
+  const fitX = (canvas.width  * padding) / Math.max(1, state.meta.cols);
+  const fitY = (canvas.height * padding) / Math.max(1, state.meta.rows);
+  const base = Math.max(0.0001, Math.min(fitX, fitY));
+  const maxAspectStretch = 12;
+  state.cellPxX = Math.min(fitX, base * maxAspectStretch);
+  state.cellPxY = Math.min(fitY, base * maxAspectStretch);
+  centerGrid();
+  scheduleRender();
+}
+
+function centerGrid() {
+  const gridW = state.meta.cols * state.cellPxX;
+  const gridH = state.meta.rows * state.cellPxY;
+  state.panX = (canvas.width  - gridW) / 2;
+  state.panY = (canvas.height - gridH) / 2;
+}
+
+function pickLevel() {
+  // Choose the smallest pyramid level L such that one level-L cell is at
+  // least 1 device pixel tall and wide.
+  const baseScale = Math.min(state.cellPxX, state.cellPxY);
+  if (baseScale >= 1) return 0;
+  const L = Math.ceil(Math.log2(1 / baseScale));
+  return Math.min(L, Math.max(0, state.meta.levels - 1));
+}
+
+function scaleAtLevel(level) {
+  return {
+    x: state.cellPxX * (1 << level),
+    y: state.cellPxY * (1 << level),
+  };
+}
+
+async function fetchTile(level, tx, ty) {
+  const ds = state.datasetId;
+  const key = `${ds}:${level}:${tx}:${ty}`;
+  if (state.tileBytes.has(key) || state.pending.has(key)) return;
+  state.pending.add(key);
+  try {
+    const r = await fetch(`/api/tile?dataset=${encodeURIComponent(ds)}&level=${level}&tx=${tx}&ty=${ty}`);
+    if (!r.ok) return;
+    const buf = new Uint8Array(await r.arrayBuffer());
+    state.tileBytes.set(key, buf);
+  } finally {
+    state.pending.delete(key);
+    scheduleRender();
+  }
+}
+
+function tileImageFor(level, tx, ty, ts) {
+  const key = `${state.datasetId}:${level}:${tx}:${ty}`;
+  let img = state.tileImg.get(key);
+  if (img) return img;
+  const bytes = state.tileBytes.get(key);
+  if (!bytes) return null;
+  img = new ImageData(ts, ts);
+  for (let i = 0; i < bytes.length; i++) {
+    const c = COLORS[bytes[i]] || COLORS[3];
+    const j = i * 4;
+    img.data[j]   = c[0];
+    img.data[j+1] = c[1];
+    img.data[j+2] = c[2];
+    img.data[j+3] = 255;
+  }
+  state.tileImg.set(key, img);
+  return img;
+}
+
+function render() {
+  state.raf = 0;
+  if (!state.meta) return;
+  // canvas state resets after each canvas.width/.height assignment, so
+  // re-disable smoothing every frame.
+  ctx.imageSmoothingEnabled = false;
+  ctx.fillStyle = BG;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const level = pickLevel();
+  const scale = scaleAtLevel(level);
+  const ts = state.meta.tile_size;
+  const baseRows = state.meta.rows;
+  const baseCols = state.meta.cols;
+  const lvlRows = Math.max(1, Math.ceil(baseRows / (1 << level)));
+  const lvlCols = Math.max(1, Math.ceil(baseCols / (1 << level)));
+
+  // visible level-cell range
+  const vc0 = Math.max(0, Math.floor(-state.panX / scale.x));
+  const vr0 = Math.max(0, Math.floor(-state.panY / scale.y));
+  const vc1 = Math.min(lvlCols, Math.ceil((canvas.width  - state.panX) / scale.x));
+  const vr1 = Math.min(lvlRows, Math.ceil((canvas.height - state.panY) / scale.y));
+
+  if (vc1 <= vc0 || vr1 <= vr0) {
+    drawZoomLabel(level);
+    return;
+  }
+
+  if (Math.min(scale.x, scale.y) >= VECTOR_SCALE_THRESHOLD) {
+    drawCellsAsRects(level, scale, ts, vr0, vr1, vc0, vc1, lvlRows, lvlCols);
+  } else {
+    drawTilesAsBitmap(level, scale, ts, vr0, vr1, vc0, vc1, lvlRows, lvlCols);
+  }
+
+  drawZoomLabel(level);
+}
+
+function drawCellsAsRects(level, scale, ts, vr0, vr1, vc0, vc1, lvlRows, lvlCols) {
+  const tx0 = Math.floor(vc0 / ts);
+  const ty0 = Math.floor(vr0 / ts);
+  const tx1 = Math.ceil(vc1 / ts);
+  const ty1 = Math.ceil(vr1 / ts);
+  const drawGridlines = Math.min(scale.x, scale.y) >= GRIDLINE_THRESHOLD;
+
+  // Per-status batching keeps fillStyle changes to four total per frame.
+  const batches = { 0: [], 1: [], 2: [], 3: [] };
+
+  for (let ty = ty0; ty < ty1; ty++) {
+    for (let tx = tx0; tx < tx1; tx++) {
+      const key = `${state.datasetId}:${level}:${tx}:${ty}`;
+      const bytes = state.tileBytes.get(key);
+      if (!bytes) {
+        // placeholder while loading
+        const dx = state.panX + tx * ts * scale.x;
+        const dy = state.panY + ty * ts * scale.y;
+        const w = Math.min(ts, lvlCols - tx * ts) * scale.x;
+        const h = Math.min(ts, lvlRows - ty * ts) * scale.y;
+        ctx.fillStyle = "#1c1c1c";
+        ctx.fillRect(dx, dy, w, h);
+        fetchTile(level, tx, ty);
+        continue;
+      }
+      const cFrom = Math.max(vc0, tx * ts);
+      const cTo   = Math.min(vc1, (tx + 1) * ts, lvlCols);
+      const rFrom = Math.max(vr0, ty * ts);
+      const rTo   = Math.min(vr1, (ty + 1) * ts, lvlRows);
+      for (let r = rFrom; r < rTo; r++) {
+        const localY = r - ty * ts;
+        for (let cc = cFrom; cc < cTo; cc++) {
+          const localX = cc - tx * ts;
+          const status = bytes[localY * ts + localX] & 0b11;
+          // Pixel-snapped rect (so adjacent cells share an edge cleanly).
+          const x0 = Math.round(state.panX + cc * scale.x);
+          const y0 = Math.round(state.panY + r  * scale.y);
+          const x1 = Math.round(state.panX + (cc + 1) * scale.x);
+          const y1 = Math.round(state.panY + (r  + 1) * scale.y);
+          batches[status].push(x0, y0, x1 - x0, y1 - y0);
+        }
+      }
+    }
+  }
+  for (const [k, arr] of Object.entries(batches)) {
+    if (!arr.length) continue;
+    ctx.fillStyle = COLOR_CSS[k];
+    for (let i = 0; i < arr.length; i += 4) {
+      ctx.fillRect(arr[i], arr[i+1], arr[i+2], arr[i+3]);
+    }
+  }
+  if (drawGridlines) {
+    ctx.strokeStyle = GRIDLINE;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let cc = vc0; cc <= vc1; cc++) {
+      const x = Math.round(state.panX + cc * scale.x) + 0.5;
+      ctx.moveTo(x, Math.round(state.panY + vr0 * scale.y));
+      ctx.lineTo(x, Math.round(state.panY + vr1 * scale.y));
+    }
+    for (let r = vr0; r <= vr1; r++) {
+      const y = Math.round(state.panY + r * scale.y) + 0.5;
+      ctx.moveTo(Math.round(state.panX + vc0 * scale.x), y);
+      ctx.lineTo(Math.round(state.panX + vc1 * scale.x), y);
+    }
+    ctx.stroke();
+  }
+}
+
+function drawTilesAsBitmap(level, scale, ts, vr0, vr1, vc0, vc1, lvlRows, lvlCols) {
+  const tx0 = Math.floor(vc0 / ts);
+  const ty0 = Math.floor(vr0 / ts);
+  const tx1 = Math.ceil(vc1 / ts);
+  const ty1 = Math.ceil(vr1 / ts);
+  if (!drawTilesAsBitmap.tmp) {
+    drawTilesAsBitmap.tmp = document.createElement("canvas");
+    drawTilesAsBitmap.tmp.width = ts;
+    drawTilesAsBitmap.tmp.height = ts;
+    drawTilesAsBitmap.tmpCtx = drawTilesAsBitmap.tmp.getContext("2d");
+  }
+  const tmp = drawTilesAsBitmap.tmp;
+  const tmpCtx = drawTilesAsBitmap.tmpCtx;
+  tmpCtx.imageSmoothingEnabled = false;
+  for (let ty = ty0; ty < ty1; ty++) {
+    for (let tx = tx0; tx < tx1; tx++) {
+      const tileCols = Math.min(ts, Math.max(0, lvlCols - tx * ts));
+      const tileRows = Math.min(ts, Math.max(0, lvlRows - ty * ts));
+      if (tileCols === 0 || tileRows === 0) continue;
+      const dx = state.panX + tx * ts * scale.x;
+      const dy = state.panY + ty * ts * scale.y;
+      const drawW = tileCols * scale.x;
+      const drawH = tileRows * scale.y;
+      const img = tileImageFor(level, tx, ty, ts);
+      if (img) {
+        tmpCtx.putImageData(img, 0, 0);
+        ctx.drawImage(tmp, 0, 0, tileCols, tileRows, dx, dy, drawW, drawH);
+      } else {
+        ctx.fillStyle = "#1c1c1c";
+        ctx.fillRect(dx, dy, drawW, drawH);
+        fetchTile(level, tx, ty);
+      }
+    }
+  }
+}
+
+function drawZoomLabel(level) {
+  document.getElementById("zoom-label").textContent =
+    `${state.meta.rows.toLocaleString()} × ${state.meta.cols} | level ${level} | ${state.cellPxX.toFixed(3)} × ${state.cellPxY.toFixed(3)} px/cell`;
+}
+
+function scheduleRender() {
+  if (state.raf) return;
+  state.raf = requestAnimationFrame(render);
+}
+
+function canvasDevicePointFromEvent(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    px: (e.clientX - rect.left) * state.dpr,
+    py: (e.clientY - rect.top) * state.dpr,
+  };
+}
+
+// ---- pan / zoom / click ----
+canvas.addEventListener("mousedown", (e) => {
+  state.dragging = true;
+  state.dragStartX = e.clientX;
+  state.dragStartY = e.clientY;
+  state.dragMoved = 0;
+  canvas.classList.add("dragging");
+});
+window.addEventListener("mouseup", () => {
+  state.dragging = false;
+  canvas.classList.remove("dragging");
+});
+canvas.addEventListener("mousemove", (e) => {
+  if (!state.dragging) updateHover(e);
+});
+
+window.addEventListener("mousemove", (e) => {
+  if (!state.dragging) return;
+  const dx = (e.clientX - state.dragStartX) * state.dpr;
+  const dy = (e.clientY - state.dragStartY) * state.dpr;
+  state.dragMoved = Math.max(state.dragMoved, Math.abs(dx) + Math.abs(dy));
+  state.panX += dx;
+  state.panY += dy;
+  state.dragStartX = e.clientX;
+  state.dragStartY = e.clientY;
+  scheduleRender();
+});
+
+canvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const factor = Math.exp(-e.deltaY * 0.001);
+  zoomAt(e.offsetX * state.dpr, e.offsetY * state.dpr, factor);
+}, { passive: false });
+
+function zoomAt(px, py, factor) {
+  const oldCellPxX = state.cellPxX;
+  const oldCellPxY = state.cellPxY;
+  const newCellPxX = Math.max(0.0001, Math.min(256, oldCellPxX * factor));
+  const newCellPxY = Math.max(0.0001, Math.min(256, oldCellPxY * factor));
+  if (newCellPxX === oldCellPxX && newCellPxY === oldCellPxY) return;
+  // Anchor the data cell currently under (px, py) so it stays put.
+  const dataX = (px - state.panX) / oldCellPxX;
+  const dataY = (py - state.panY) / oldCellPxY;
+  state.cellPxX = newCellPxX;
+  state.cellPxY = newCellPxY;
+  state.panX = px - dataX * newCellPxX;
+  state.panY = py - dataY * newCellPxY;
+  scheduleRender();
+}
+
+document.getElementById("btn-zoom-in").onclick = () => {
+  zoomAt(canvas.width / 2, canvas.height / 2, 1.5);
+};
+document.getElementById("btn-zoom-out").onclick = () => {
+  zoomAt(canvas.width / 2, canvas.height / 2, 1 / 1.5);
+};
+document.getElementById("btn-reset").onclick = () => {
+  fitToScreen();
+};
+
+canvas.addEventListener("click", async (e) => {
+  // Don't treat a drag-end as a click.
+  if (state.dragMoved > 4) return;
+  const { px, py } = canvasDevicePointFromEvent(e);
+  const col = Math.floor((px - state.panX) / state.cellPxX);
+  const row = Math.floor((py - state.panY) / state.cellPxY);
+  if (row < 0 || col < 0 || row >= state.meta.rows || col >= state.meta.cols) return;
+  await openCellModal(row, col);
+});
+
+function updateHover(e) {
+  if (!state.meta) return;
+  const { px, py } = canvasDevicePointFromEvent(e);
+  const col = Math.floor((px - state.panX) / state.cellPxX);
+  const row = Math.floor((py - state.panY) / state.cellPxY);
+  if (row < 0 || col < 0 || row >= state.meta.rows || col >= state.meta.cols) {
+    statusBar.textContent = "";
+    canvas.classList.remove("inspectable");
+    return;
+  }
+  statusBar.textContent = `row ${row.toLocaleString()}, ${state.meta.column_names[col]}`;
+  canvas.classList.add("inspectable");
+}
+
+canvas.addEventListener("mouseleave", () => {
+  statusBar.textContent = "";
+  canvas.classList.remove("inspectable");
+});
+
+async function openCellModal(row, col) {
+  const r = await fetch(`/api/cell?dataset=${encodeURIComponent(state.datasetId)}&row=${row}&col=${col}`);
+  if (!r.ok) return;
+  const data = await r.json();
+  document.getElementById("modal-title").innerHTML =
+    `cell <code>row ${row}, ${escapeHtml(data.column_name)}</code> ` +
+    `<span class="pill ${data.status}">${data.status}</span>`;
+  const body = document.getElementById("modal-body");
+  body.innerHTML = `
+    <table>
+      <tr><th>side</th><th>value</th></tr>
+      <tr><td>left</td><td><code>${formatValue(data.left)}</code></td></tr>
+      <tr><td>right</td><td><code>${formatValue(data.right)}</code></td></tr>
+      ${data.abs_diff != null ? `<tr><td>abs diff</td><td>${data.abs_diff}</td></tr>` : ""}
+      ${data.rel_diff != null ? `<tr><td>rel diff</td><td>${data.rel_diff}</td></tr>` : ""}
+    </table>
+  `;
+  document.getElementById("modal-backdrop").classList.add("visible");
+}
+
+function closeModal() {
+  document.getElementById("modal-backdrop").classList.remove("visible");
+}
+
+document.getElementById("modal-backdrop").addEventListener("click", (e) => {
+  if (e.target.id === "modal-backdrop") closeModal();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeModal();
+});
+
+function formatValue(v) {
+  if (v === null || v === undefined) return "<i>null</i>";
+  return escapeHtml(String(v));
+}
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+loadDatasets().catch((e) => {
+  console.error(e);
+  document.getElementById("banner").textContent = "failed to load: " + e.message;
+  document.getElementById("banner").classList.add("visible");
+});
+</script>
+</body>
+</html>
