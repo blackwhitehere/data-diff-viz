@@ -118,7 +118,7 @@ async fn api_meta(
         tile_size: ds.pyramid.tile_size,
         levels: ds.pyramid.num_levels(),
         column_names: ds.display_columns.as_ref().clone(),
-        status_counts: base.status_counts(),
+        status_counts: ds.status_counts,
         alignment: ds.report.as_ref().clone(),
         rel_tol: state.tol.rel_tol,
         abs_tol: state.tol.abs_tol,

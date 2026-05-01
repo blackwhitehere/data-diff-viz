@@ -28,7 +28,7 @@ impl Default for Tolerance {
 /// order — pass the column names explicitly to make that contract explicit
 /// and to drive the grid layout.
 ///
-/// Per-column work is parallelized via rayon.
+/// Work is parallelized over the packed row-major byte buffer.
 pub fn build_status_grid(
     left: &DataFrame,
     right: &DataFrame,
@@ -42,124 +42,153 @@ pub fn build_status_grid(
         return StatusGrid::new(n_rows, n_cols);
     }
 
-    let col_statuses: Vec<Vec<CellStatus>> = columns
-        .par_iter()
-        .map(|name| compare_column_by_name(left, right, name, n_rows, tol))
+    let comparers: Vec<ColumnCompare<'_>> = columns
+        .iter()
+        .map(|name| ColumnCompare::new(left, right, name))
         .collect();
 
-    let mut flat = vec![CellStatus::Missing; n_rows * n_cols];
-    for (c, col) in col_statuses.iter().enumerate() {
-        for (r, s) in col.iter().enumerate() {
-            flat[r * n_cols + c] = *s;
-        }
-    }
-    StatusGrid::from_flat(n_rows, n_cols, &flat)
+    let total = n_rows * n_cols;
+    let mut packed = vec![0u8; total.div_ceil(4)];
+    packed
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(byte_idx, byte)| {
+            let mut value = 0u8;
+            let first_idx = byte_idx * 4;
+            for offset in 0..4 {
+                let idx = first_idx + offset;
+                if idx >= total {
+                    break;
+                }
+                let row = idx / n_cols;
+                let col = idx % n_cols;
+                let status = comparers[col].status(row, tol) as u8;
+                value |= status << (offset * 2);
+            }
+            *byte = value;
+        });
+
+    StatusGrid::from_packed(n_rows, n_cols, packed)
 }
 
-fn compare_column_by_name(
-    left: &DataFrame,
-    right: &DataFrame,
-    name: &str,
-    n_rows: usize,
-    tol: Tolerance,
-) -> Vec<CellStatus> {
-    let l = left.column(name).ok();
-    let r = right.column(name).ok();
-    match (l, r) {
-        (Some(l), Some(r)) => {
-            let ls = l.as_materialized_series();
-            let rs = r.as_materialized_series();
-            compare_series(ls, rs, n_rows, tol)
-        }
-        _ => vec![CellStatus::Missing; n_rows],
-    }
+enum ColumnCompare<'a> {
+    Missing,
+    TypeMismatch,
+    Float64 {
+        left: &'a Float64Chunked,
+        right: &'a Float64Chunked,
+        common: usize,
+    },
+    Float32 {
+        left: &'a Float32Chunked,
+        right: &'a Float32Chunked,
+        common: usize,
+    },
+    Other {
+        left: &'a Series,
+        right: &'a Series,
+        common: usize,
+    },
 }
 
-fn compare_series(l: &Series, r: &Series, n_rows: usize, tol: Tolerance) -> Vec<CellStatus> {
-    let l_len = l.len();
-    let r_len = r.len();
-    let common = l_len.min(r_len);
+impl<'a> ColumnCompare<'a> {
+    fn new(left: &'a DataFrame, right: &'a DataFrame, name: &str) -> Self {
+        let Some(left) = left.column(name).ok().map(|c| c.as_materialized_series()) else {
+            return Self::Missing;
+        };
+        let Some(right) = right.column(name).ok().map(|c| c.as_materialized_series()) else {
+            return Self::Missing;
+        };
 
-    if l.dtype() != r.dtype() {
-        // Type mismatch — flag entire column as Diff (not Missing — values
-        // do exist on both sides; they're just incomparable).
-        return vec![CellStatus::Diff; n_rows];
+        if left.dtype() != right.dtype() {
+            return Self::TypeMismatch;
+        }
+
+        let common = left.len().min(right.len());
+        match left.dtype() {
+            DataType::Float64 => Self::Float64 {
+                left: left.f64().expect("dtype-checked"),
+                right: right.f64().expect("dtype-checked"),
+                common,
+            },
+            DataType::Float32 => Self::Float32 {
+                left: left.f32().expect("dtype-checked"),
+                right: right.f32().expect("dtype-checked"),
+                common,
+            },
+            _ => Self::Other {
+                left,
+                right,
+                common,
+            },
+        }
     }
 
-    let mut out = vec![CellStatus::Missing; n_rows];
-
-    let dtype = l.dtype().clone();
-    match dtype {
-        DataType::Float64 => fill_floats(
-            l.f64().expect("dtype-checked"),
-            r.f64().expect("dtype-checked"),
-            common,
-            &mut out,
-            tol,
-        ),
-        DataType::Float32 => fill_floats_32(
-            l.f32().expect("dtype-checked"),
-            r.f32().expect("dtype-checked"),
-            common,
-            &mut out,
-            tol,
-        ),
-        _ => {
-            // Exact-equality fallback for everything else (ints, bool,
-            // strings, dates, etc.). AnyValue::eq treats nulls as not-equal,
-            // so we handle (null, null) explicitly.
-            for (i, slot) in out.iter_mut().enumerate().take(common) {
-                let a = l.get(i).ok();
-                let b = r.get(i).ok();
-                *slot = match (a, b) {
-                    (None, None) => CellStatus::Equal,
-                    (Some(av), Some(bv)) => {
-                        if av_is_null(&av) && av_is_null(&bv) {
-                            CellStatus::Equal
-                        } else if av_is_null(&av) || av_is_null(&bv) {
-                            CellStatus::Diff
-                        } else if av == bv {
-                            CellStatus::Equal
-                        } else {
-                            CellStatus::Diff
-                        }
-                    }
-                    _ => CellStatus::Diff,
-                };
+    fn status(&self, row: usize, tol: Tolerance) -> CellStatus {
+        match self {
+            Self::Missing => CellStatus::Missing,
+            // Type mismatch flags the whole column as Diff: values exist on
+            // both sides, but are incomparable.
+            Self::TypeMismatch => CellStatus::Diff,
+            Self::Float64 {
+                left,
+                right,
+                common,
+            } => {
+                if row >= *common {
+                    CellStatus::Missing
+                } else {
+                    compare_f64(left.get(row), right.get(row), tol)
+                }
+            }
+            Self::Float32 {
+                left,
+                right,
+                common,
+            } => {
+                if row >= *common {
+                    CellStatus::Missing
+                } else {
+                    let a = left.get(row).map(|v| v as f64);
+                    let b = right.get(row).map(|v| v as f64);
+                    compare_f64(a, b, tol)
+                }
+            }
+            Self::Other {
+                left,
+                right,
+                common,
+            } => {
+                if row >= *common {
+                    CellStatus::Missing
+                } else {
+                    compare_any_values(left.get(row).ok(), right.get(row).ok())
+                }
             }
         }
     }
-    out
+}
+
+fn compare_any_values(a: Option<AnyValue<'_>>, b: Option<AnyValue<'_>>) -> CellStatus {
+    match (a, b) {
+        (None, None) => CellStatus::Equal,
+        (Some(av), Some(bv)) => {
+            if av_is_null(&av) && av_is_null(&bv) {
+                CellStatus::Equal
+            } else if av_is_null(&av) || av_is_null(&bv) {
+                CellStatus::Diff
+            } else if av == bv {
+                CellStatus::Equal
+            } else {
+                CellStatus::Diff
+            }
+        }
+        _ => CellStatus::Diff,
+    }
 }
 
 fn av_is_null(v: &AnyValue<'_>) -> bool {
     matches!(v, AnyValue::Null)
-}
-
-fn fill_floats(
-    l: &Float64Chunked,
-    r: &Float64Chunked,
-    common: usize,
-    out: &mut [CellStatus],
-    tol: Tolerance,
-) {
-    for (i, slot) in out.iter_mut().enumerate().take(common) {
-        *slot = compare_f64(l.get(i), r.get(i), tol);
-    }
-}
-
-fn fill_floats_32(
-    l: &Float32Chunked,
-    r: &Float32Chunked,
-    common: usize,
-    out: &mut [CellStatus],
-    tol: Tolerance,
-) {
-    for (i, slot) in out.iter_mut().enumerate().take(common) {
-        let a = l.get(i).map(|v| v as f64);
-        let b = r.get(i).map(|v| v as f64);
-        *slot = compare_f64(a, b, tol);
-    }
 }
 
 pub fn compare_f64(a: Option<f64>, b: Option<f64>, tol: Tolerance) -> CellStatus {
@@ -327,5 +356,76 @@ mod tests {
         assert_eq!(g.get(0, 0), CellStatus::Equal);
         assert_eq!(g.get(0, 1), CellStatus::Missing);
         assert_eq!(g.get(1, 1), CellStatus::Missing);
+    }
+
+    #[test]
+    fn direct_packing_handles_partial_final_byte() {
+        let left = df! {
+            "a" => [1i64, 2, 3],
+            "b" => [10i64, 20, 30],
+            "c" => [1.0f64, 2.0, 3.0],
+        }
+        .unwrap();
+        let right = df! {
+            "a" => [1i64, 99, 3],
+            "b" => [10i64, 20, 31],
+            "c" => [1.0f64, 2.0 + 1e-9, 4.0],
+        }
+        .unwrap();
+        let cols = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let g = build_status_grid(&left, &right, &cols, t());
+
+        assert_eq!(g.rows, 3);
+        assert_eq!(g.cols, 3);
+        assert_eq!(g.packed.len(), 3);
+        assert_eq!(
+            g.to_byte_grid(),
+            vec![
+                CellStatus::Equal as u8,
+                CellStatus::Equal as u8,
+                CellStatus::Equal as u8,
+                CellStatus::Diff as u8,
+                CellStatus::Equal as u8,
+                CellStatus::Close as u8,
+                CellStatus::Equal as u8,
+                CellStatus::Diff as u8,
+                CellStatus::Diff as u8,
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_packing_preserves_missing_and_type_mismatch_edges() {
+        let left = df! {
+            "same" => [Some(1i64), None, Some(3)],
+            "type_mismatch" => [1i64, 2, 3],
+            "left_only" => ["a", "b", "c"],
+            "short" => [1.0f64, 2.0, 3.0],
+        }
+        .unwrap();
+        let right = df! {
+            "same" => [Some(1i64), None],
+            "type_mismatch" => [1.0f64, 2.0],
+            "short" => [1.0f64, 9.0],
+        }
+        .unwrap();
+        let cols = vec![
+            "same".to_string(),
+            "type_mismatch".to_string(),
+            "left_only".to_string(),
+            "short".to_string(),
+        ];
+        let g = build_status_grid(&left, &right, &cols, t());
+
+        assert_eq!(g.get(0, 0), CellStatus::Equal);
+        assert_eq!(g.get(1, 0), CellStatus::Equal);
+        assert_eq!(g.get(2, 0), CellStatus::Missing);
+        assert_eq!(g.get(0, 1), CellStatus::Diff);
+        assert_eq!(g.get(2, 1), CellStatus::Diff);
+        assert_eq!(g.get(0, 2), CellStatus::Missing);
+        assert_eq!(g.get(2, 2), CellStatus::Missing);
+        assert_eq!(g.get(0, 3), CellStatus::Equal);
+        assert_eq!(g.get(1, 3), CellStatus::Diff);
+        assert_eq!(g.get(2, 3), CellStatus::Missing);
     }
 }

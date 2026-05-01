@@ -78,6 +78,12 @@ impl StatusGrid {
         }
     }
 
+    pub fn from_packed(rows: usize, cols: usize, packed: Vec<u8>) -> Self {
+        let total = rows.saturating_mul(cols);
+        assert_eq!(packed.len(), total.div_ceil(4), "packed length mismatch");
+        Self { rows, cols, packed }
+    }
+
     /// Build a grid from a flat row-major slice of statuses.
     pub fn from_flat(rows: usize, cols: usize, flat: &[CellStatus]) -> Self {
         assert_eq!(flat.len(), rows * cols, "flat length mismatch");

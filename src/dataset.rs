@@ -11,7 +11,7 @@ use serde::Serialize;
 
 use crate::align::{detect_and_align, AlignmentReport};
 use crate::compare::{build_status_grid, Tolerance};
-use crate::grid::Pyramid;
+use crate::grid::{Pyramid, StatusCounts};
 
 #[derive(Clone)]
 pub struct Dataset {
@@ -21,6 +21,7 @@ pub struct Dataset {
     pub right: Arc<DataFrame>,
     pub display_columns: Arc<Vec<String>>,
     pub pyramid: Arc<Pyramid>,
+    pub status_counts: StatusCounts,
     pub report: Arc<AlignmentReport>,
 }
 
@@ -59,6 +60,7 @@ pub fn build_dataset(
     let (left, right, report) = detect_and_align(left, right, tol)?;
     let display_columns = report.display_columns.clone();
     let grid = build_status_grid(&left, &right, &display_columns, tol);
+    let status_counts = grid.status_counts();
     let pyramid = Pyramid::build(grid, tile_size);
     Ok(Dataset {
         id,
@@ -67,6 +69,7 @@ pub fn build_dataset(
         right: Arc::new(right),
         display_columns: Arc::new(display_columns),
         pyramid: Arc::new(pyramid),
+        status_counts,
         report: Arc::new(report),
     })
 }

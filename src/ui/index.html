@@ -173,9 +173,9 @@ async function loadDatasets() {
 
 datasetSelect.addEventListener("change", async (e) => {
   state.datasetId = e.target.value;
-  // Clear caches for the previous dataset's tiles. We keyed by ds:L:tx:ty,
-  // so the new dataset's fetches will start fresh; the old entries stay
-  // resident until GC, which is fine for a few datasets.
+  // Clear caches for the previous dataset's tiles so large multi-dataset
+  // sessions do not retain old byte buffers or ImageData objects.
+  state.tileBytes.clear();
   state.tileImg.clear();
   await loadMeta();
 });
